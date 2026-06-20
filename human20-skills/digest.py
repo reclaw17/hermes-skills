@@ -72,6 +72,68 @@ def _md2_escape(text: str) -> str:
     return "".join(out)
 
 
+def _html_escape(text: str) -> str:
+    """Экранировать <, >, & для Telegram HTML."""
+    if not text:
+        return ""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+# Формат-специфичные помощники: возвращают (open, close) токены для тегов.
+# fmt="md2" — MarkdownV2, fmt="html" — Telegram HTML.
+def _fmt_tokens(fmt: str) -> dict[str, tuple[str, str]]:
+    if fmt == "html":
+        return {
+            "b": ("<b>", "</b>"),
+            "i": ("<i>", "</i>"),
+            "code": ("<code>", "</code>"),
+            "pre": ("<pre>", "</pre>"),
+            "details": ("<details>", "</details>"),
+            "blockquote": ("<blockquote>", "</blockquote>"),
+            "link": ("<a href=\"{url}\">", "</a>"),
+        }
+    # md2 (по умолчанию, оставлено для совместимости)
+    return {
+        "b": ("*", "*"),
+        "i": ("_", "_"),
+        "code": ("`", "`"),
+        "pre": ("```", "```"),
+        "details": ("<details>", "</details>"),
+        "blockquote": ("> ", ""),
+        "link": ("[{text}]({url})", ""),
+    }
+
+
+def _fmt_escape(text: str, fmt: str) -> str:
+    if fmt == "html":
+        return _html_escape(text)
+    return _md2_escape(text)
+
+
+def _fmt_link(text: str, url: str, fmt: str) -> str:
+    text_esc = _fmt_escape(text, fmt)
+    url_esc = _html_escape(url) if fmt == "html" else url
+    if fmt == "html":
+        return f'<a href="{url_esc}">{text_esc}</a>'
+    return f'[{text_esc}]({url_esc})'
+
+
+def _fmt_bold(text: str, fmt: str) -> str:
+    esc = _fmt_escape(text, fmt)
+    o, c = _fmt_tokens(fmt)["b"]
+    return f"{o}{esc}{c}"
+
+
+def _fmt_italic(text: str, fmt: str) -> str:
+    esc = _fmt_escape(text, fmt)
+    o, c = _fmt_tokens(fmt)["i"]
+    return f"{o}{esc}{c}"
+
+
 def _md2_escape_inline(text: str) -> str:
     """Экранировать без бэкслеша перед > и +, чтобы не ломать blockquote/task list.
     Используется внутри уже структурированных блоков."""
@@ -351,14 +413,21 @@ def _short_topic(title: str) -> str:
     return t[:59] + "…"
 
 
-def format_human(digest: dict[str, Any], chat_meta: dict[str, Any] | None = None) -> str:
-    """Шаблон v2: task list в шапке, треды, blockquote, <details>, sub-подписи."""
+def format_human(
+    digest: dict[str, Any],
+    chat_meta: dict[str, Any] | None = None,
+    fmt: str = "html",
+) -> str:
+    """Шаблон v2: task list в шапке, треды, blockquote, <details>, sub-подписи.
+
+    fmt: "html" (по умолчанию) или "md2" (MarkdownV2, оставлено для совместимости).
+    """
     if not digest.get("ok"):
-        return f"⚠️ human20-chat-digest: {_md2_escape(digest.get('error', 'unknown error'))}"
+        return f"⚠️ human20-chat-digest: {_fmt_escape(digest.get('error', 'unknown error'), fmt)}"
 
     count = digest["count"]
     if count == 0:
-        return "💤 В чате Human 2\\.0 нового ничего нет\\."
+        return "💤 В чате Human 2.0 нового ничего нет."
 
     threads = digest.get("threads") or []
     if not threads:
@@ -373,33 +442,46 @@ def format_human(digest: dict[str, Any], chat_meta: dict[str, Any] | None = None
 
     chat_id = (chat_meta or {}).get("chat_id") if chat_meta else None
     chat_username = (chat_meta or {}).get("username") if chat_meta else None
-    # Если chat_id не на верхнем уровне, берём из первого сообщения.
     if not chat_id and digest["items"]:
         chat_id = digest["items"][0].get("_raw", {}).get("chat_id")
 
-    # Шапка
     first_ts = (digest["items"][0].get("date") or "")[:16].replace("T", " ")
     last_ts = (digest["items"][-1].get("date") or "")[:16].replace("T", " ")
     authors = digest["authors"]
 
-    # Топ-3 авторов по числу сообщений.
     author_counts: dict[str, int] = {}
     for it in digest["items"]:
         author_counts[it["username"]] = author_counts.get(it["username"], 0) + 1
     top_authors = sorted(author_counts.items(), key=lambda kv: -kv[1])[:3]
 
+    # Префиксы чекбоксов: ✅/- [x] vs ☑️/<s>...</s> не нужны. Универсально используем эмодзи.
+    if fmt == "html":
+        CHECK_DONE = "✅"
+        CHECK_TODO = "🔲"
+    else:
+        CHECK_DONE = "- [x]"
+        CHECK_TODO = "- [ ]"
+
     lines: list[str] = []
-    lines.append(f"*✦ Human 2\\.0 · {_md2_escape(first_ts)}–{_md2_escape(last_ts)} · {count} новых ✦*")
+    # Шапка
+    header = f"✦ Human 2.0 · {first_ts}–{last_ts} · {count} новых ✦"
+    lines.append(_fmt_bold(header, fmt))
     lines.append("")
-    lines.append("- [x] 🕐 Период: ~30 минут")
+
+    lines.append(f"{CHECK_DONE} 🕐 Период: ~30 минут")
     authors_word = _plural(len(authors), ("автор", "автора", "авторов"))
     threads_word = _plural(len(threads), ("тред", "треда", "тредов"))
-    lines.append(f"- [x] 👤 {len(authors)} {authors_word} · 💬 {count} сообщений · 🧵 {len(threads)} {threads_word}")
+    lines.append(
+        f"{CHECK_DONE} 👤 {len(authors)} {authors_word} · 💬 {count} сообщений · 🧵 {len(threads)} {threads_word}"
+    )
     if authors:
-        lines.append("- [x] 🔥 Участники: " + ", ".join(f"@{_md2_escape(a)}" for a in authors[:8]))
+        lines.append(
+            CHECK_DONE + " 🔥 Участники: "
+            + ", ".join(f"@{_fmt_escape(a, fmt)}" for a in authors[:8])
+        )
     if top_authors:
-        top_str = " · ".join(f"@{_md2_escape(a)} ×{n}" for a, n in top_authors)
-        lines.append(f"- [x] 🏆 Топ: {top_str}")
+        top_str = " · ".join(f"@{_fmt_escape(a, fmt)} ×{n}" for a, n in top_authors)
+        lines.append(f"{CHECK_DONE} 🏆 Топ: {top_str}")
 
     # Тело по тредам
     for ti, thread in enumerate(threads, 1):
@@ -410,32 +492,35 @@ def format_human(digest: dict[str, Any], chat_meta: dict[str, Any] | None = None
         author_set = sorted({it["username"] for it in items})
 
         lines.append("")
-        lines.append(
-            f"*▎Тред {ti} \\| {status_icon} {_md2_escape(topic_title)}*{relevant_mark}"
-        )
+        thread_head = f"▎Тред {ti} | {status_icon} {topic_title}{relevant_mark}"
+        lines.append(_fmt_bold(thread_head, fmt))
+
         sub_bits = [_plural(len(items), ("сообщение", "сообщения", "сообщений"))]
         if author_set:
-            sub_bits.append(", ".join(f"@{_md2_escape(a)}" for a in author_set[:3]))
+            sub_bits.append(", ".join(f"@{_fmt_escape(a, fmt)}" for a in author_set[:3]))
             if len(author_set) > 3:
-                sub_bits.append(f"\\+{len(author_set) - 3}")
+                sub_bits.append(f"+{len(author_set) - 3}")
         lines.append("  " + " · ".join(sub_bits))
 
-        # Сворачиваем старые сообщения: первые N-2 уходят в <details>.
+        # Сворачиваем старые сообщения
         VISIBLE = 2
         if len(items) > VISIBLE:
             hidden = items[:-VISIBLE]
             visible = items[-VISIBLE:]
-            hidden_lines = [
-                f"{_md2_escape((it.get('date') or '')[:16].replace('T', ' '))} · "
-                f"@{_md2_escape(it.get('username') or '?')} · "
-                f"{_md2_escape(_truncate(it.get('text') or '', 80))}"
-                for it in hidden
-            ]
-            lines.append(
-                f"  <details>📂 ещё {len(hidden)} сообщ: "
-                + "\\n".join(_md2_escape(l) for l in hidden_lines)
-                + "</details>"
-            )
+            hidden_lines = []
+            for it in hidden:
+                ts = (it.get("date") or "")[:16].replace("T", " ")
+                uname = _fmt_escape(it.get("username") or "?", fmt)
+                preview = _fmt_escape(_truncate(it.get("text") or "", 80), fmt)
+                hidden_lines.append(f"{ts} · @{uname} · {preview}")
+            if fmt == "html":
+                # Telegram HTML пока не поддерживает <details>. Используем префикс ▸
+                # и обычный текст. Внешне выглядит как «свёрнутый список».
+                inner = " · ".join(hidden_lines)
+                lines.append(f"  <i>▸ ещё {len(hidden)} сообщ: {inner}</i>")
+            else:
+                inner = "\\n".join(hidden_lines)
+                lines.append(f"  <details>📂 ещё {len(hidden)} сообщ: {inner}</details>")
             items_to_show = visible
         else:
             items_to_show = items
@@ -444,24 +529,34 @@ def format_human(digest: dict[str, Any], chat_meta: dict[str, Any] | None = None
             ts = (it.get("date") or "")[:16].replace("T", " ")
             icon = TYPE_ICONS.get(it.get("type"), "💬")
             star = " ⭐" if it.get("relevant") else ""
-            uname = it.get("username") or "?"
+            uname = _fmt_escape(it.get("username") or "?", fmt)
             mid = it["message_id"]
             link = _telegram_link(chat_id, mid)
 
-            lines.append(f"- [ ] {icon} @{_md2_escape(uname)} \\| {_md2_escape(ts)} \\| \\#{mid}{star}")
-            for chunk in _wrap_quote(it.get("text") or ""):
-                lines.append(f"  > {chunk}")
-            lines.append(f"  <details>📎 {link}</details>")
+            line = f"{CHECK_TODO} {icon} @{uname} | {ts} | #{mid}{star}"
+            lines.append(line)
+            for chunk in _wrap_quote(it.get("text") or "", fmt=fmt):
+                lines.append(chunk)
+            # Ссылка на сообщение — отдельно строкой.
+            if fmt == "html":
+                link_html = f'<a href="{link}">📎 #{mid}</a>'
+                lines.append(f"  {link_html}")
+            else:
+                lines.append(f"  <details>📎 {link}</details>")
 
     # Подвал
     lines.append("")
     lines.append("──────────")
     lines.append("")
-    lines.append("*💡 Инсайды и что полезно для нас*")
-    lines.append("_(блок готовится LLM в cron\\-job; если видишь это — он ещё не отработал)_")
+    lines.append(_fmt_bold("💡 Инсайды и что полезно для нас", fmt))
+    lines.append(
+        _fmt_italic(
+            "(блок готовится LLM в cron-job; если видишь это — он ещё не отработал)",
+            fmt,
+        )
+    )
 
     cursor = digest.get("new_cursor") or 0
-    # Ссылка на чат для «открыть чат»
     if chat_username:
         chat_link = f"https://t.me/{chat_username}"
     elif chat_id:
@@ -474,11 +569,13 @@ def format_human(digest: dict[str, Any], chat_meta: dict[str, Any] | None = None
 
     lines.append("")
     if chat_link:
-        lines.append(
-            f"_Курсор → {cursor} · [следующий тик через ~30 мин]({chat_link})_"
-        )
+        if fmt == "html":
+            link_html = f'<a href="{chat_link}">следующий тик через ~30 мин</a>'
+            lines.append(f"<i>Курсор → {cursor} · {link_html}</i>")
+        else:
+            lines.append(_fmt_italic(f"Курсор → {cursor} · следующий тик через ~30 мин", fmt))
     else:
-        lines.append(f"_Курсор → {cursor} · следующий тик через ~30 мин_")
+        lines.append(_fmt_italic(f"Курсор → {cursor} · следующий тик через ~30 мин", fmt))
 
     return "\n".join(lines)
 
@@ -496,25 +593,27 @@ def _plural(n: int, forms: tuple[str, str, str]) -> str:
     return forms[2]
 
 
-def _wrap_quote(text: str, width: int = 80) -> list[str]:
-    """Разбить текст на строки шириной width, экранируя спец-символы."""
+def _wrap_quote(text: str, width: int = 80, fmt: str = "html") -> list[str]:
+    """Разбить текст на строки blockquote, экранируя спец-символы."""
     flat = (text or "").replace("\n", " ").replace("\r", " ").strip()
     if not flat:
-        return [_md2_escape("(пусто)")]
-    # Простая разбивка по словам.
+        return [_fmt_escape("(пусто)", fmt)]
     words = flat.split()
-    lines: list[str] = []
+    raw_lines: list[str] = []
     cur = ""
     for w in words:
         if len(cur) + len(w) + 1 > width:
             if cur:
-                lines.append(cur)
+                raw_lines.append(cur)
             cur = w
         else:
             cur = (cur + " " + w).strip()
     if cur:
-        lines.append(cur)
-    return [_md2_escape(l) for l in lines]
+        raw_lines.append(cur)
+
+    if fmt == "html":
+        return [f"<blockquote>{_html_escape(l)}</blockquote>" for l in raw_lines]
+    return [f"> {_md2_escape(l)}" for l in raw_lines]
 
 
 def apply_classification(state: dict[str, Any], classification: dict[str, Any]) -> None:
@@ -550,6 +649,12 @@ def main(argv: list[str] | None = None) -> int:
         "--full",
         action="store_true",
         help="не обрезать тексты сообщений (для LLM-анализа)",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["html", "md2"],
+        default="html",
+        help="формат вывода: html (Telegram HTML, по умолчанию) или md2 (MarkdownV2)",
     )
     parser.add_argument(
         "--apply-classification",
@@ -608,7 +713,7 @@ def main(argv: list[str] | None = None) -> int:
             out["chat"] = chat_meta
         print(json.dumps(out, ensure_ascii=False, indent=2))
     else:
-        print(format_human(digest, chat_meta=chat_meta))
+        print(format_human(digest, chat_meta=chat_meta, fmt=args.format))
     return 0
 
 
