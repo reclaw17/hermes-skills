@@ -195,12 +195,15 @@ def fetch_chat(client: Human20McpClient) -> tuple[list[dict[str, Any]], dict[str
 
 
 def _cluster_threads(
-    items: list[dict[str, Any]], gap_minutes: int = 5
+    items: list[dict[str, Any]], gap_minutes: int = 5, merge_by_topic: bool = True
 ) -> list[dict[str, Any]]:
-    """Грубая кластеризация: тред = серия сообщений в пределах gap_minutes,
-    с возможной сменой автора (диалог). Возвращает [{topic_id, title, items}]."""
-    threads: list[dict[str, Any]] = []
-    cur: list[dict[str, Any]] = []
+    """Грубая кластеризация: тред = серия сообщений в пределах gap_minutes
+    с одинаковым topic (если LLM классифицировал).
+
+    merge_by_topic=True: даже если время далеко, объединять сообщения с тем же topic.
+    """
+    if not items:
+        return []
 
     def _ts(it: dict[str, Any]) -> datetime | None:
         d = _message_date(it.get("_raw", {})) or it.get("date")
@@ -211,30 +214,50 @@ def _cluster_threads(
         except Exception:
             return None
 
-    for it in items:
+    threads: list[dict[str, Any]] = []
+    cur: list[dict[str, Any]] = [items[0]]
+
+    for it in items[1:]:
         ts = _ts(it)
-        if not cur:
-            cur = [it]
-            continue
         prev_ts = _ts(cur[-1])
-        if ts and prev_ts and (ts - prev_ts).total_seconds() <= gap_minutes * 60:
+        same_topic = (
+            merge_by_topic
+            and it.get("topic")
+            and it.get("topic") == cur[0].get("topic")
+        )
+        time_close = ts and prev_ts and (ts - prev_ts).total_seconds() <= gap_minutes * 60
+
+        if same_topic or (time_close and not (it.get("topic") or cur[0].get("topic"))):
             cur.append(it)
         else:
             threads.append(_finalize_thread(cur))
             cur = [it]
     if cur:
         threads.append(_finalize_thread(cur))
+
+    # Сортировка: ⭐ первыми, потом по времени последнего сообщения (новые выше).
+    threads.sort(
+        key=lambda t: (
+            0 if t.get("relevant") else 1,
+            -(_ts(t["items"][-1]) or datetime.min).timestamp(),
+        )
+    )
     return threads
 
 
 def _finalize_thread(items: list[dict[str, Any]]) -> dict[str, Any]:
     """Сформировать описание треда из списка сообщений."""
-    topic_id = f"t_{items[0]['message_id']}"
-    # Используем topic из state.classified, если есть.
+    first_id = items[0]["message_id"]
+    topic_id = f"t_{first_id}"
     topic = items[0].get("topic")
+    # Если у разных сообщений разные topic — берём самый частый.
+    if not topic:
+        from collections import Counter
+        topics_seen = [it.get("topic") for it in items if it.get("topic")]
+        if topics_seen:
+            topic = Counter(topics_seen).most_common(1)[0][0]
     relevant = any(it.get("relevant") for it in items)
     has_question = any(it.get("type") == "question" for it in items)
-    # «Answer» — явный ответ с типом answer или короткий реплай после вопроса.
     last = items[-1]
     has_answer = (
         last.get("type") == "answer"
@@ -339,7 +362,6 @@ def format_human(digest: dict[str, Any], chat_meta: dict[str, Any] | None = None
 
     threads = digest.get("threads") or []
     if not threads:
-        # fallback: всё в одну кучу
         threads = [
             {
                 "topic_id": "all",
@@ -349,20 +371,35 @@ def format_human(digest: dict[str, Any], chat_meta: dict[str, Any] | None = None
             }
         ]
 
+    chat_id = (chat_meta or {}).get("chat_id") if chat_meta else None
+    chat_username = (chat_meta or {}).get("username") if chat_meta else None
+    # Если chat_id не на верхнем уровне, берём из первого сообщения.
+    if not chat_id and digest["items"]:
+        chat_id = digest["items"][0].get("_raw", {}).get("chat_id")
+
     # Шапка
     first_ts = (digest["items"][0].get("date") or "")[:16].replace("T", " ")
     last_ts = (digest["items"][-1].get("date") or "")[:16].replace("T", " ")
     authors = digest["authors"]
 
+    # Топ-3 авторов по числу сообщений.
+    author_counts: dict[str, int] = {}
+    for it in digest["items"]:
+        author_counts[it["username"]] = author_counts.get(it["username"], 0) + 1
+    top_authors = sorted(author_counts.items(), key=lambda kv: -kv[1])[:3]
+
     lines: list[str] = []
     lines.append(f"*✦ Human 2\\.0 · {_md2_escape(first_ts)}–{_md2_escape(last_ts)} · {count} новых ✦*")
     lines.append("")
     lines.append("- [x] 🕐 Период: ~30 минут")
-    authors_word = "автор" if len(authors) == 1 else ("автора" if 2 <= len(authors) % 10 <= 4 and len(authors) % 100 not in (12, 13, 14) else "авторов")
-    threads_word = "тред" if len(threads) == 1 else ("треда" if 2 <= len(threads) % 10 <= 4 and len(threads) % 100 not in (12, 13, 14) else "тредов")
+    authors_word = _plural(len(authors), ("автор", "автора", "авторов"))
+    threads_word = _plural(len(threads), ("тред", "треда", "тредов"))
     lines.append(f"- [x] 👤 {len(authors)} {authors_word} · 💬 {count} сообщений · 🧵 {len(threads)} {threads_word}")
     if authors:
         lines.append("- [x] 🔥 Участники: " + ", ".join(f"@{_md2_escape(a)}" for a in authors[:8]))
+    if top_authors:
+        top_str = " · ".join(f"@{_md2_escape(a)} ×{n}" for a, n in top_authors)
+        lines.append(f"- [x] 🏆 Топ: {top_str}")
 
     # Тело по тредам
     for ti, thread in enumerate(threads, 1):
@@ -376,32 +413,44 @@ def format_human(digest: dict[str, Any], chat_meta: dict[str, Any] | None = None
         lines.append(
             f"*▎Тред {ti} \\| {status_icon} {_md2_escape(topic_title)}*{relevant_mark}"
         )
-        sub_bits = [f"{len(items)} сообщ"]
+        sub_bits = [_plural(len(items), ("сообщение", "сообщения", "сообщений"))]
         if author_set:
             sub_bits.append(", ".join(f"@{_md2_escape(a)}" for a in author_set[:3]))
             if len(author_set) > 3:
                 sub_bits.append(f"\\+{len(author_set) - 3}")
         lines.append("  " + " · ".join(sub_bits))
 
-        for it in items:
+        # Сворачиваем старые сообщения: первые N-2 уходят в <details>.
+        VISIBLE = 2
+        if len(items) > VISIBLE:
+            hidden = items[:-VISIBLE]
+            visible = items[-VISIBLE:]
+            hidden_lines = [
+                f"{_md2_escape((it.get('date') or '')[:16].replace('T', ' '))} · "
+                f"@{_md2_escape(it.get('username') or '?')} · "
+                f"{_md2_escape(_truncate(it.get('text') or '', 80))}"
+                for it in hidden
+            ]
+            lines.append(
+                f"  <details>📂 ещё {len(hidden)} сообщ: "
+                + "\\n".join(_md2_escape(l) for l in hidden_lines)
+                + "</details>"
+            )
+            items_to_show = visible
+        else:
+            items_to_show = items
+
+        for it in items_to_show:
             ts = (it.get("date") or "")[:16].replace("T", " ")
             icon = TYPE_ICONS.get(it.get("type"), "💬")
             star = " ⭐" if it.get("relevant") else ""
             uname = it.get("username") or "?"
             mid = it["message_id"]
+            link = _telegram_link(chat_id, mid)
 
-            # Заголовок пункта
             lines.append(f"- [ ] {icon} @{_md2_escape(uname)} \\| {_md2_escape(ts)} \\| \\#{mid}{star}")
-
-            # Тело цитатой (blockquote)
-            text = it.get("text") or ""
-            for chunk in _wrap_quote(text, width=80):
+            for chunk in _wrap_quote(it.get("text") or ""):
                 lines.append(f"  > {chunk}")
-
-            # Ссылка (details)
-            link = _telegram_link(
-                (chat_meta or {}).get("chat_id") if chat_meta else None, mid
-            )
             lines.append(f"  <details>📎 {link}</details>")
 
     # Подвал
@@ -412,10 +461,39 @@ def format_human(digest: dict[str, Any], chat_meta: dict[str, Any] | None = None
     lines.append("_(блок готовится LLM в cron\\-job; если видишь это — он ещё не отработал)_")
 
     cursor = digest.get("new_cursor") or 0
+    # Ссылка на чат для «открыть чат»
+    if chat_username:
+        chat_link = f"https://t.me/{chat_username}"
+    elif chat_id:
+        cid = str(chat_id)
+        if cid.startswith("-100"):
+            cid = cid[4:]
+        chat_link = f"https://t.me/c/{cid}"
+    else:
+        chat_link = None
+
     lines.append("")
-    lines.append(f"_Курсор → {cursor} · следующий тик через ~30 мин_")
+    if chat_link:
+        lines.append(
+            f"_Курсор → {cursor} · [следующий тик через ~30 мин]({chat_link})_"
+        )
+    else:
+        lines.append(f"_Курсор → {cursor} · следующий тик через ~30 мин_")
 
     return "\n".join(lines)
+
+
+def _plural(n: int, forms: tuple[str, str, str]) -> str:
+    """Русское склонение: (1, 2-4, 5+)."""
+    n100 = n % 100
+    if 11 <= n100 <= 14:
+        return forms[2]
+    n10 = n % 10
+    if n10 == 1:
+        return forms[0]
+    if 2 <= n10 <= 4:
+        return forms[1]
+    return forms[2]
 
 
 def _wrap_quote(text: str, width: int = 80) -> list[str]:
