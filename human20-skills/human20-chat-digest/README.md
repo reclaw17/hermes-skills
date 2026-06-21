@@ -11,6 +11,23 @@
 - Возвращает JSON: `count`, `authors`, `items[]` (id / date / username / preview).
 - Хранит курсор в `state.json` (рядом со скриптом), `chmod 600`.
 
+## Архитектура
+
+- `digest.py` — CLI и оркестрация.
+- `chat.py` — загрузка/нормализация сообщений.
+- `builder.py` — фильтрация новых сообщений и сборка структуры дайджеста.
+- `threads.py` — кластеризация тредов и эвристика типов.
+- `format_human.py` + `formats.py` — рендер в HTML/MarkdownV2 и helpers.
+- `state.py` — чтение/запись `state.json`, применение классификации.
+- `telegram.py` — генерация ссылок `t.me/c/...`.
+- `tests/` — pytest для модулей и интеграционного сценария.
+
+Для переиспользования тред-логики есть совместимый импорт:
+
+```python
+from human20_chat_digest_threads import cluster_threads
+```
+
 ## Что **не** делает
 
 - Не отправляет сообщения в Human20.

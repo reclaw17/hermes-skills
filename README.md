@@ -19,7 +19,7 @@
 - хранит курсор (`message_id`) в локальном `state.json`;
 - работает с `cron` каждые 30 минут, доставка в любой чат Hermes.
 
-➡️ [Документация](./human20-skills/SKILL.md)
+➡️ [Документация](./human20-skills/human20-chat-digest/SKILL.md)
 
 ## Установка
 
