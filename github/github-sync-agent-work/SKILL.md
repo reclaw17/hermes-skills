@@ -5,6 +5,14 @@ description: Sync files between a local agent-work directory and a GitHub repo v
 
 # Sync agent-work ↔ GitHub repo via gh api
 
+## Prerequisites
+
+- `gh` CLI installed and authenticated: `gh auth status` should show `Logged in`
+- `jq` installed (for JSON construction in shell)
+- `base64` and `python3` available (used for content encoding / md5 checks)
+- Read access to the target repo (for sync down)
+- Write access to the target repo (for sync up)
+
 ## When to use
 
 - Editing one or a few files in `agent-work/coding/`, `agent-work/docs/`, `agent-work/plans/`, `agent-work/reports/`
@@ -112,6 +120,8 @@ After any sync:
 
 ## When NOT to use
 
-- Bulk changes (tens of files) — prefer `git clone` + local `git push`
-- If a `git remote` is already set up — `git pull` / `git push` is simpler
-- Binary files or files >1MB — `gh api` is unreliable
+- **Bulk changes (tens of files)** — prefer `git clone` + local `git push`. Each PUT is a separate API call.
+- **If a `git remote` is already set up** — `git pull` / `git push` is faster and gives you history.
+- **Binary files or files >1MB** — `gh api` content endpoint is unreliable for large payloads; use `git clone` or `gh release` upload.
+- **Repos with rich git history you care about** — this skill does NOT preserve history, branches, or tags; it just syncs current file contents.
+- **Collaborative workflows** — if multiple people push to the same paths, `gh api PUT` will create conflicts with no merge mechanism. Use git for that.
